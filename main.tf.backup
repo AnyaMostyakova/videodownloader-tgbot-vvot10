@@ -1,0 +1,180 @@
+# Определение локальной переменной с префиксом
+locals {
+  prefix = "vvot10"
+}
+
+# 1. Сервисный аккаунт
+resource "yandex_iam_service_account" "sa" {
+  name        = "${local.prefix}-sa"
+  description = "Service account for functions and API Gateway"
+}
+
+# 2. Назначение ролей сервисному аккаунту
+# Для работы с очередями (YMQ)
+resource "yandex_resourcemanager_folder_iam_member" "sa_mq" {
+  folder_id = var.folder_id
+  role      = "ymq.admin"
+  member    = "serviceAccount:${yandex_iam_service_account.sa.id}"
+}
+
+# Для работы с Object Storage
+resource "yandex_resourcemanager_folder_iam_member" "sa_storage" {
+  folder_id = var.folder_id
+  role      = "storage.admin"
+  member    = "serviceAccount:${yandex_iam_service_account.sa.id}"
+}
+
+# 3. Очереди сообщений (Message Queue)
+resource "yandex_message_queue" "queue_receiver" {
+  name                       = "${local.prefix}-queue-receiver"
+  visibility_timeout_seconds = 30
+}
+
+resource "yandex_message_queue" "queue_downloader" {
+  name                       = "${local.prefix}-queue-downloader"
+  visibility_timeout_seconds = 600
+}
+
+# 4. Бакет Object Storage
+resource "yandex_storage_bucket" "bucket" {
+  bucket = "${local.prefix}-tg-video"
+  acl    = "private"
+}
+
+# 5. Архивация кода функций (Terraform сам создаст папку 'build')
+data "archive_file" "receiver_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/functions/receiver"
+  output_path = "${path.module}/build/receiver.zip"
+}
+
+data "archive_file" "downloader_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/functions/downloader"
+  output_path = "${path.module}/build/downloader.zip"
+}
+
+# 6. Cloud Function: Приемник (Receiver)
+resource "yandex_function" "func_receiver" {
+  name               = "${local.prefix}-func-receiver"
+  description        = "Handles incoming Telegram updates"
+  runtime            = "python311"
+  entrypoint         = "index.handler"
+  memory             = 128
+  execution_timeout  = 10
+  service_account_id = yandex_iam_service_account.sa.id
+
+  environment = {
+    TG_TOKEN             = var.tg_bot_key
+    DOWNLOADER_QUEUE_URL = yandex_message_queue.queue_downloader.url
+  }
+
+  content {
+    zip_filename = data.archive_file.receiver_zip.output_path
+  }
+
+  depends_on = [
+    yandex_iam_service_account.sa,
+    yandex_message_queue.queue_downloader
+  ]
+}
+
+# 7. Cloud Function: Загрузчик (Downloader)
+resource "yandex_function" "func_downloader" {
+  name               = "${local.prefix}-func-downloader"
+  description        = "Downloads video from Telegram and stores it"
+  runtime            = "python311"
+  entrypoint         = "index.handler"
+  memory             = 256  # Нужно больше памяти для видео
+  execution_timeout  = 60   # Долгий таймаут для загрузки
+  service_account_id = yandex_iam_service_account.sa.id
+
+  environment = {
+    TG_TOKEN = var.tg_bot_key
+    BUCKET   = yandex_storage_bucket.bucket.bucket
+    API_BASE = "https://${yandex_api_gateway.api.domain}"
+  }
+
+  content {
+    zip_filename = data.archive_file.downloader_zip.output_path
+  }
+
+  depends_on = [
+    yandex_iam_service_account.sa,
+    yandex_storage_bucket.bucket,
+    yandex_api_gateway.api  # Нужен domain от API Gateway
+  ]
+}
+
+# 8. Триггеры для функций
+resource "yandex_function_trigger" "trigger_receiver" {
+  name        = "${local.prefix}-trigger-receiver"
+  description = "Triggers when a message arrives in the receiver queue"
+
+  message_queue {
+    queue_id           = yandex_message_queue.queue_receiver.arn
+    service_account_id = yandex_iam_service_account.sa.id
+    batch_cutoff       = 10   # Макс. время ожидания (сек)
+    batch_size         = 1    # Кол-во сообщений за вызов
+  }
+
+  function {
+    id                 = yandex_function.func_receiver.id
+    service_account_id = yandex_iam_service_account.sa.id
+  }
+}
+
+resource "yandex_function_trigger" "trigger_downloader" {
+  name        = "${local.prefix}-trigger-downloader"
+  description = "Triggers when a task arrives in the downloader queue"
+
+  message_queue {
+    queue_id           = yandex_message_queue.queue_downloader.arn
+    service_account_id = yandex_iam_service_account.sa.id
+    batch_cutoff       = 10
+    batch_size         = 1
+  }
+
+  function {
+    id                 = yandex_function.func_downloader.id
+    service_account_id = yandex_iam_service_account.sa.id
+  }
+}
+
+# 9. API Gateway
+# Шаблонизация OpenAPI спецификации для подстановки переменных
+data "template_file" "openapi_spec" {
+  template = file("${path.module}/openapi.yaml")
+  vars = {
+    queue_receiver_id = yandex_message_queue.queue_receiver.id
+    bucket_name       = yandex_storage_bucket.bucket.bucket
+    sa_id             = yandex_iam_service_account.sa.id
+  }
+}
+
+resource "yandex_api_gateway" "api" {
+  name        = "${local.prefix}-api"
+  description = "API Gateway for Telegram bot"
+  spec        = data.template_file.openapi_spec.rendered
+}
+
+# 10. Установка вебхука для Telegram бота
+resource "telegram_bot_webhook" "webhook" {
+  url = "https://${yandex_api_gateway.api.domain}/webhook"
+}
+
+# 11. Вывод важной информации
+output "api_gateway_domain" {
+  value       = yandex_api_gateway.api.domain
+  description = "Domain name of the deployed API Gateway"
+}
+
+output "webhook_url" {
+  value       = "https://${yandex_api_gateway.api.domain}/webhook"
+  description = "Full webhook URL for Telegram bot"
+}
+
+output "bucket_name" {
+  value       = yandex_storage_bucket.bucket.bucket
+  description = "Name of the created storage bucket"
+}

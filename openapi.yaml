@@ -1,0 +1,33 @@
+openapi: 3.0.0
+info:
+  title: vvot10-api
+  version: 1.0.0
+paths:
+  /webhook:
+    post:
+      summary: Telegram webhook
+      x-yc-apigateway-integration:
+        type: cloud_functions  # Возвращаем поддерживаемый тип
+        function_id: ${receiver_function_id}
+        service_account_id: ${sa_id}
+        tag: "$latest"
+      responses:
+        '200':
+          description: OK
+  /video/{key}:
+    get:
+      summary: Download video from Object Storage
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      x-yc-apigateway-integration:
+        type: object_storage
+        bucket: ${bucket_name}
+        object: '{key}'
+        service_account_id: ${sa_id}
+      responses:
+        '200':
+          description: Video file
